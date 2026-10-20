@@ -463,17 +463,40 @@ impl GHCB {
         self.set_exit_info_1_valid(exit_info_1);
         self.set_exit_info_2_valid(exit_info_2);
 
-        let ghcb_address = VirtAddr::from(self as *const GHCB);
-        let ghcb_pa = u64::from(virt_to_phys(ghcb_address));
-        // Disable interrupts between writing the MSR and making the GHCB call
-        // to prevent reentrant use of the GHCB MSR.
-        let guard = IrqGuard::new();
-        // SAFETY: GHCB is already allocated and setup so this is safe.
-        unsafe {
-            write_msr(SEV_GHCB, ghcb_pa);
+        // Test-only seam: when a mock hypervisor is installed, skip MSR/VMGEXIT
+        // hardware and let the mock mutate the GHCB (including the shared buffer)
+        // in place. Production logic below (SW_EXITINFO1 check) still runs unchanged.
+        #[cfg(test)]
+        if psc_repro_mock::invoke_if_installed(self) {
+            // Fall through to the existing SW_EXITINFO1 check.
+        } else {
+            let ghcb_address = VirtAddr::from(self as *const GHCB);
+            let ghcb_pa = u64::from(virt_to_phys(ghcb_address));
+            // Disable interrupts between writing the MSR and making the GHCB call
+            // to prevent reentrant use of the GHCB MSR.
+            let guard = IrqGuard::new();
+            // SAFETY: GHCB is already allocated and setup so this is safe.
+            unsafe {
+                write_msr(SEV_GHCB, ghcb_pa);
+            }
+            raw_vmgexit();
+            drop(guard);
         }
-        raw_vmgexit();
-        drop(guard);
+
+        #[cfg(not(test))]
+        {
+            let ghcb_address = VirtAddr::from(self as *const GHCB);
+            let ghcb_pa = u64::from(virt_to_phys(ghcb_address));
+            // Disable interrupts between writing the MSR and making the GHCB call
+            // to prevent reentrant use of the GHCB MSR.
+            let guard = IrqGuard::new();
+            // SAFETY: GHCB is already allocated and setup so this is safe.
+            unsafe {
+                write_msr(SEV_GHCB, ghcb_pa);
+            }
+            raw_vmgexit();
+            drop(guard);
+        }
 
         let sw_exit_info_1 = self.get_exit_info_1_valid()?;
         if sw_exit_info_1 != 0 {
@@ -961,3 +984,370 @@ const _: () = assert!(
         && offset_of!(GHCB, usage) == 0xffc
         && mem::size_of::<GHCB>() == 0x1000
 );
+
+/// Test-only mock hypervisor for deterministic GHCB PSC reproduction.
+///
+/// This module injects at the VMGEXIT boundary only. Production
+/// `GHCB::page_state_change()` / `GHCB::vmgexit()` response handling is not
+/// rewritten; the mock mutates the live GHCB shared buffer and SW_EXITINFOx
+/// fields in place, then returns into the unmodified guest-side checks.
+#[cfg(test)]
+pub mod psc_repro_mock {
+    extern crate alloc;
+
+    use super::*;
+    use crate::locking::SpinLock;
+    use alloc::vec::Vec;
+
+    /// One hypervisor response applied on a single VMGEXIT.
+    #[derive(Clone, Debug)]
+    pub struct MockPscResponse {
+        pub sw_exit_info_1: u64,
+        pub sw_exit_info_2: u64,
+        pub cur_entry: u16,
+        pub end_entry: Option<u16>,
+        pub reserved: Option<u32>,
+        /// If set, overwrite entry[0].cur_page (low 12 bits).
+        pub entry0_cur_page: Option<u16>,
+    }
+
+    impl MockPscResponse {
+        pub fn ok_partial(cur_entry: u16) -> Self {
+            Self {
+                sw_exit_info_1: 0,
+                sw_exit_info_2: 0,
+                cur_entry,
+                end_entry: None,
+                reserved: None,
+                entry0_cur_page: None,
+            }
+        }
+
+        pub fn ok_complete(cur_entry: u16) -> Self {
+            Self::ok_partial(cur_entry)
+        }
+
+        /// Linux `VMGEXIT_PSC_ERROR_INVALID_ENTRY` = ((1UL << 32) | 2).
+        pub fn invalid_entry(cur_entry: u16) -> Self {
+            Self {
+                sw_exit_info_1: 0,
+                sw_exit_info_2: 0x0000_0001_0000_0002,
+                cur_entry,
+                end_entry: None,
+                reserved: None,
+                entry0_cur_page: None,
+            }
+        }
+    }
+
+    struct MockState {
+        responses: Vec<MockPscResponse>,
+        next: usize,
+        vmgexit_count: usize,
+    }
+
+    static MOCK: SpinLock<Option<MockState>> = SpinLock::new(None);
+    static LAST_COUNT: SpinLock<usize> = SpinLock::new(0);
+
+    pub fn install(responses: Vec<MockPscResponse>) {
+        *MOCK.lock() = Some(MockState {
+            responses,
+            next: 0,
+            vmgexit_count: 0,
+        });
+        *LAST_COUNT.lock() = 0;
+    }
+
+    pub fn uninstall() {
+        if let Some(state) = MOCK.lock().take() {
+            *LAST_COUNT.lock() = state.vmgexit_count;
+        }
+    }
+
+    pub fn vmgexit_count() -> usize {
+        MOCK.lock()
+            .as_ref()
+            .map(|s| s.vmgexit_count)
+            .unwrap_or_else(|| *LAST_COUNT.lock())
+    }
+
+    /// Returns true if a mock handled this VMGEXIT.
+    pub fn invoke_if_installed(ghcb: &GHCB) -> bool {
+        let mut guard = MOCK.lock();
+        let Some(state) = guard.as_mut() else {
+            return false;
+        };
+        assert!(
+            state.next < state.responses.len(),
+            "mock hypervisor ran out of PSC responses (call #{})",
+            state.vmgexit_count + 1
+        );
+        let resp = state.responses[state.next].clone();
+        state.next += 1;
+        state.vmgexit_count += 1;
+        apply_response(ghcb, &resp);
+        true
+    }
+
+    fn apply_response(ghcb: &GHCB, resp: &MockPscResponse) {
+        // Overwrite SW_EXITINFO fields (validity bits already set by guest).
+        ghcb.sw_exit_info_1
+            .store(resp.sw_exit_info_1, Ordering::Relaxed);
+        ghcb.sw_exit_info_2
+            .store(resp.sw_exit_info_2, Ordering::Relaxed);
+
+        let (_cur, mut end, mut reserved) = read_header(ghcb);
+        let cur = resp.cur_entry;
+        if let Some(e) = resp.end_entry {
+            end = e;
+        }
+        if let Some(r) = resp.reserved {
+            reserved = r;
+        }
+        write_header(ghcb, cur, end, reserved);
+
+        if let Some(cur_page) = resp.entry0_cur_page {
+            let mut entry = read_entry(ghcb, 0);
+            entry = (entry & !0xfffu64) | (u64::from(cur_page) & 0xfff);
+            write_entry(ghcb, 0, entry);
+        }
+    }
+
+    pub fn read_header(ghcb: &GHCB) -> (u16, u16, u32) {
+        let mut bytes = [0u8; 8];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = ghcb.buffer[i].load(Ordering::Relaxed);
+        }
+        let cur = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let end = u16::from_le_bytes([bytes[2], bytes[3]]);
+        let reserved = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        (cur, end, reserved)
+    }
+
+    fn write_header(ghcb: &GHCB, cur: u16, end: u16, reserved: u32) {
+        let header = PageStateChangeHeader {
+            cur_entry: cur,
+            end_entry: end,
+            reserved,
+        };
+        ghcb.write_buffer(&header, 0).expect("write PSC header");
+    }
+
+    pub fn read_entry(ghcb: &GHCB, index: usize) -> u64 {
+        let offset = 8 + index * 8;
+        let mut bytes = [0u8; 8];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = ghcb.buffer[offset + i].load(Ordering::Relaxed);
+        }
+        u64::from_le_bytes(bytes)
+    }
+
+    fn write_entry(ghcb: &GHCB, index: usize, entry: u64) {
+        let offset = 8 + index * 8;
+        ghcb.write_buffer(&entry, offset)
+            .expect("write PSC entry");
+    }
+
+    pub fn entry_cur_page(entry: u64) -> u16 {
+        (entry & 0xfff) as u16
+    }
+}
+
+/// Deterministic reproduction of GHCB PSC completion / error handling gaps.
+///
+/// These tests call the **upstream** `GHCB::page_state_change()` implementation
+/// with a mock hypervisor injected only at the VMGEXIT boundary.
+#[cfg(test)]
+mod psc_repro_tests {
+    extern crate alloc;
+    // Host unit-test harness links std; use it only for diagnostic output.
+    extern crate std;
+
+    use super::psc_repro_mock::{self, MockPscResponse};
+    use super::*;
+    use crate::error::SvsmError;
+    use crate::platform::PageStateChangeOp;
+    use crate::types::{PAGE_SIZE, PAGE_SIZE_2M};
+    use crate::utils::MemoryRegion;
+    use alloc::boxed::Box;
+    use alloc::format;
+    use alloc::string::String;
+    use alloc::vec;
+    use std::eprintln;
+
+    /// Allocate a zeroed GHCB page for userspace unit tests.
+    fn new_test_ghcb() -> Box<GHCB> {
+        Box::new(GHCB::new_zeroed())
+    }
+
+    fn region_4k(start: u64, pages: usize) -> MemoryRegion<PhysAddr> {
+        MemoryRegion::new(PhysAddr::from(start), pages * PAGE_SIZE)
+    }
+
+    fn region_2m(start: u64) -> MemoryRegion<PhysAddr> {
+        MemoryRegion::new(PhysAddr::from(start), PAGE_SIZE_2M)
+    }
+
+    fn format_result(result: &Result<(), SvsmError>) -> String {
+        match result {
+            Ok(()) => String::from("Ok(())"),
+            Err(SvsmError::Ghcb(GhcbError::VmgexitError(i1, i2))) => {
+                format!("Err(VmgexitError({i1:#x}, {i2:#x}))")
+            }
+            Err(e) => format!("Err({e:?})"),
+        }
+    }
+
+    /// Test A: hypervisor only completes the first of three 4 KiB entries.
+    ///
+    /// Per GHCB §4.1.6 / Linux `vmgexit_psc()`, the guest must retry until
+    /// `cur_entry > end_entry`. Upstream returns after a single VMGEXIT when
+    /// SW_EXITINFO1 == 0.
+    #[test]
+    fn test_a_psc_partial_completion() {
+        let ghcb = new_test_ghcb();
+        psc_repro_mock::install(vec![
+            MockPscResponse::ok_partial(1), // completed entry 0 only; end_entry still 2
+            MockPscResponse::ok_complete(3), // cur_entry > end_entry => done
+        ]);
+
+        let region = region_4k(0x40_0000, 3);
+        let result = ghcb.page_state_change(region, PageStateChangeOp::Private);
+        let calls = psc_repro_mock::vmgexit_count();
+        let (cur, end, _) = psc_repro_mock::read_header(&ghcb);
+        psc_repro_mock::uninstall();
+
+        eprintln!("=== Test A: psc_partial_completion ===");
+        eprintln!("Expected VMGEXIT calls: 2");
+        eprintln!("Actual VMGEXIT calls:   {calls}");
+        eprintln!("Expected: continue until cur_entry > end_entry, then Ok");
+        eprintln!(
+            "Actual:   page_state_change returned {}, buffer cur_entry={cur} end_entry={end}",
+            format_result(&result)
+        );
+
+        // BUG REPRODUCED if only one VMGEXIT and Ok(()).
+        assert_eq!(
+            calls, 1,
+            "BUG REPRODUCED: expected 2 VMGEXIT calls for partial PSC, got {calls}"
+        );
+        assert!(
+            result.is_ok(),
+            "BUG REPRODUCED: upstream returned Ok after incomplete PSC"
+        );
+        assert!(
+            cur <= end,
+            "BUG REPRODUCED: buffer still incomplete (cur={cur} end={end}) but function returned Ok"
+        );
+        eprintln!("Result: BUG REPRODUCED");
+    }
+
+    /// Test B: PSC-specific error in SW_EXITINFO2 with SW_EXITINFO1 == 0.
+    ///
+    /// `VMGEXIT_PSC_ERROR_INVALID_ENTRY` = 0x00000001_00000002.
+    /// Linux guest treats any non-zero SW_EXITINFO2 as failure.
+    /// Upstream `vmgexit()` only checks SW_EXITINFO1.
+    #[test]
+    fn test_b_psc_error_in_exitinfo2() {
+        let ghcb = new_test_ghcb();
+        psc_repro_mock::install(vec![MockPscResponse::invalid_entry(1)]);
+
+        let region = region_4k(0x40_0000, 3);
+        let result = ghcb.page_state_change(region, PageStateChangeOp::Private);
+        let calls = psc_repro_mock::vmgexit_count();
+        let exit2 = ghcb.sw_exit_info_2.load(Ordering::Relaxed);
+        psc_repro_mock::uninstall();
+
+        eprintln!("=== Test B: psc_error_in_exitinfo2 ===");
+        eprintln!("SW_EXITINFO1 = 0");
+        eprintln!("SW_EXITINFO2 = {exit2:#018x}");
+        eprintln!("Expected: Err(PSC invalid entry / non-zero EXITINFO2)");
+        eprintln!("Actual:   {}", format_result(&result));
+        eprintln!("VMGEXIT calls: {calls}");
+
+        assert_eq!(calls, 1);
+        assert_eq!(exit2, 0x0000_0001_0000_0002);
+        assert!(
+            result.is_ok(),
+            "BUG REPRODUCED: expected PSC error, got {}",
+            format_result(&result)
+        );
+        eprintln!("Result: BUG REPRODUCED");
+    }
+
+    /// Test C: 2 MiB entry partially completed (cur_page = 128 of 512).
+    #[test]
+    fn test_c_psc_2m_partial_cur_page() {
+        let ghcb = new_test_ghcb();
+        psc_repro_mock::install(vec![
+            MockPscResponse {
+                sw_exit_info_1: 0,
+                sw_exit_info_2: 0,
+                cur_entry: 0,
+                end_entry: Some(0),
+                reserved: None,
+                entry0_cur_page: Some(128),
+            },
+            MockPscResponse {
+                sw_exit_info_1: 0,
+                sw_exit_info_2: 0,
+                cur_entry: 1,
+                end_entry: Some(0),
+                reserved: None,
+                entry0_cur_page: Some(512),
+            },
+        ]);
+
+        // 2 MiB aligned GPA
+        let region = region_2m(0x40_0000);
+        let result = ghcb.page_state_change(region, PageStateChangeOp::Private);
+        let calls = psc_repro_mock::vmgexit_count();
+        let (cur, end, _) = psc_repro_mock::read_header(&ghcb);
+        let entry0 = psc_repro_mock::read_entry(&ghcb, 0);
+        let cur_page = psc_repro_mock::entry_cur_page(entry0);
+        psc_repro_mock::uninstall();
+
+        eprintln!("=== Test C: psc_2m_partial_cur_page ===");
+        eprintln!("Expected VMGEXIT calls: 2 (resume from cur_page=128)");
+        eprintln!("Actual VMGEXIT calls:   {calls}");
+        eprintln!(
+            "Buffer after return: cur_entry={cur} end_entry={end} entry0.cur_page={cur_page}"
+        );
+        eprintln!("Actual result: {}", format_result(&result));
+
+        assert_eq!(
+            calls, 1,
+            "BUG REPRODUCED: expected retry for partial 2MiB PSC, got {calls} VMGEXIT(s)"
+        );
+        assert!(result.is_ok());
+        assert_eq!(cur, 0);
+        assert_eq!(end, 0);
+        assert_eq!(cur_page, 128);
+        eprintln!("Result: BUG REPRODUCED");
+    }
+
+    /// Test D: normal full completion in one VMGEXIT (negative control).
+    #[test]
+    fn test_d_psc_full_completion() {
+        let ghcb = new_test_ghcb();
+        psc_repro_mock::install(vec![MockPscResponse::ok_complete(3)]);
+
+        let region = region_4k(0x40_0000, 3);
+        let result = ghcb.page_state_change(region, PageStateChangeOp::Private);
+        let calls = psc_repro_mock::vmgexit_count();
+        let (cur, end, _) = psc_repro_mock::read_header(&ghcb);
+        psc_repro_mock::uninstall();
+
+        eprintln!("=== Test D: psc_full_completion ===");
+        eprintln!("Expected VMGEXIT calls: 1");
+        eprintln!("Actual VMGEXIT calls:   {calls}");
+        eprintln!("Expected: Ok(())");
+        eprintln!("Actual:   {}", format_result(&result));
+        eprintln!("Buffer: cur_entry={cur} end_entry={end}");
+
+        assert_eq!(calls, 1);
+        assert!(result.is_ok());
+        assert!(cur > end);
+        eprintln!("Result: PASS (mock normal path OK)");
+    }
+}
